@@ -61,6 +61,16 @@ CallbackReturn Sciurus17Hardware::on_init(
     hw_velocity_states_[joint.name] = std::numeric_limits<double>::quiet_NaN();
     hw_effort_states_[joint.name] = std::numeric_limits<double>::quiet_NaN();
 
+    // Build joint bounds map for clamping
+    double bound_min = -M_PI, bound_max = M_PI;
+    for (const auto & iface : joint.command_interfaces) {
+      if (iface.name == hardware_interface::HW_IF_POSITION && !iface.min.empty() && !iface.max.empty()) {
+        bound_min = std::stod(iface.min);
+        bound_max = std::stod(iface.max);
+      }
+    }
+    joint_bounds_[joint.name] = {bound_min, bound_max};
+
     // Load joint parameters
     if (joint.parameters.at("current_to_effort") != "") {
       current_to_effort_[joint.name] = std::stod(joint.parameters.at("current_to_effort"));
@@ -177,7 +187,7 @@ CallbackReturn Sciurus17Hardware::on_activate(const rclcpp_lifecycle::State & /*
   // Set present joint positions to hw_position_commands for safe start-up.
   read(prev_comm_timestamp_, rclcpp::Duration::from_seconds(0));
   for (const auto & joint : info_.joints) {
-    const auto present_position = hw_position_states_[joint.name];
+    auto present_position = hw_position_states_[joint.name];
     auto limit_min = present_position;
     auto limit_max = present_position;
     for (const auto & interface : joint.command_interfaces) {
@@ -186,22 +196,32 @@ CallbackReturn Sciurus17Hardware::on_activate(const rclcpp_lifecycle::State & /*
         limit_max = std::stod(interface.max);
       }
     }
-    hw_position_commands_[joint.name] = std::clamp(present_position, limit_min, limit_max);
+    // Clamp position to bounds (protects against stale/invalid values from failed sync_read).
+    present_position = std::clamp(present_position, limit_min, limit_max);
+    hw_position_states_[joint.name] = present_position;
+    hw_position_commands_[joint.name] = present_position;
   }
   write(prev_comm_timestamp_, rclcpp::Duration::from_seconds(0));
 
+  bool activated = false;
   for (const auto & group_name : GROUP_NAMES) {
     if (!hardware_->write_position_pid_gain_to_group(
         group_name, START_P_GAIN, START_I_GAIN, START_D_GAIN))
     {
-      RCLCPP_ERROR(LOGGER, "Failed to set PID gains.");
-      return CallbackReturn::ERROR;
+      RCLCPP_WARN(LOGGER, "Failed to set PID gains for '%s'. Skipping.", group_name.c_str());
+      continue;
     }
 
     if (!hardware_->torque_on(group_name)) {
-      RCLCPP_ERROR(LOGGER, "Failed to set torque on.");
-      return CallbackReturn::ERROR;
+      RCLCPP_WARN(LOGGER, "Failed to set torque on for '%s'. Skipping.", group_name.c_str());
+      continue;
     }
+    activated = true;
+  }
+
+  if (!activated) {
+    RCLCPP_ERROR(LOGGER, "Failed to activate any servo group.");
+    return CallbackReturn::ERROR;
   }
 
   return CallbackReturn::SUCCESS;
@@ -214,8 +234,8 @@ CallbackReturn Sciurus17Hardware::on_deactivate(const rclcpp_lifecycle::State & 
     if (!hardware_->write_position_pid_gain_to_group(
         group_name, STOP_P_GAIN, STOP_I_GAIN, STOP_D_GAIN))
     {
-      RCLCPP_ERROR(LOGGER, "Failed to set PID gains.");
-      return CallbackReturn::ERROR;
+      RCLCPP_WARN(LOGGER, "Failed to set PID gains for '%s'. Skipping.", group_name.c_str());
+      continue;
     }
   }
 
@@ -233,17 +253,36 @@ return_type Sciurus17Hardware::read(
     return return_type::ERROR;
   }
 
+  bool any_success = false;
   for (const auto & group_name : GROUP_NAMES) {
-    if (!hardware_->sync_read(group_name)) {
-      RCLCPP_ERROR(LOGGER, "Failed to sync read from servo motors.");
-      // sync_readに失敗しても通信は継続させる。
-      // 不確かなデータをセットしないようにOKを返す。
-      return return_type::OK;
+    if (sync_read_fail_count_[group_name] >= SYNC_READ_SKIP_THRESHOLD) {
+      continue;
     }
+    if (!hardware_->sync_read(group_name)) {
+      sync_read_fail_count_[group_name]++;
+      if (sync_read_fail_count_[group_name] == SYNC_READ_SKIP_THRESHOLD) {
+        RCLCPP_WARN(
+          LOGGER,
+          "sync read for '%s' failed %d times consecutively. Skipping this group.",
+          group_name.c_str(), SYNC_READ_SKIP_THRESHOLD);
+      } else {
+        RCLCPP_ERROR(LOGGER, "Failed to sync read from servo motors.");
+      }
+    } else {
+      sync_read_fail_count_[group_name] = 0;
+      any_success = true;
+    }
+  }
+
+  if (!any_success) {
+    return return_type::OK;
   }
 
   for (const auto & joint : info_.joints) {
     hardware_->get_position(joint.name, hw_position_states_[joint.name]);
+    const auto & bounds = joint_bounds_.at(joint.name);
+    hw_position_states_[joint.name] = std::clamp(
+      hw_position_states_[joint.name], bounds.first, bounds.second);
   }
 
   for (const auto & joint : info_.joints) {

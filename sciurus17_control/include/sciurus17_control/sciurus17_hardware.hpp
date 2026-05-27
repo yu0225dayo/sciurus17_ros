@@ -81,6 +81,11 @@ private:
   rclcpp::Clock steady_clock_;
   rclcpp::Time prev_comm_timestamp_;
   bool timeout_has_printed_;
+
+  std::map<std::string, int> sync_read_fail_count_;
+  static constexpr int SYNC_READ_SKIP_THRESHOLD = 10;
+
+  std::map<std::string, std::pair<double, double>> joint_bounds_;
 };
 }  // namespace sciurus17_control
 

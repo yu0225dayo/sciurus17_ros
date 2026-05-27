@@ -46,7 +46,6 @@ def generate_launch_description():
     }
 
     example_node = Node(
-        name=[LaunchConfiguration('example'), '_node'],
         package='sciurus17_examples',
         executable=LaunchConfiguration('example'),
         output='screen',
