@@ -2,6 +2,8 @@
 
 trajectory_execution:
   allowed_start_tolerance: 0.1
+  allowed_execution_duration_scaling: 3.0   # 予測実行時間の倍率 (デフォルト1.2)
+  allowed_goal_duration_margin: 5.0         # 追加マージン秒数 (デフォルト0.5)
 
 moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControllerManager
 
